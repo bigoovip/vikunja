@@ -1,0 +1,179 @@
+From 247f9a2152f02b0c5b7347eef9641e390fcead49 Mon Sep 17 00:00:00 2001
+From: bigoovip <86590318+bigoovip@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 15:23:19 +0800
+Subject: [PATCH 2/2] caldav: pass the CalDAV user's timezone into the export
+
+The storage provider reads users.timezone (empty/invalid falls back to nil, i.e.
+the historical UTC-only export) and hands it to GetCaldavTodosForTasks for both
+list and sync-collection requests.
+---
+ pkg/routes/caldav/listStorageProvider.go | 47 +++++++++++++++++++-----
+ pkg/routes/caldav/sync_collection.go     |  2 +-
+ 2 files changed, 39 insertions(+), 10 deletions(-)
+
+diff --git a/pkg/routes/caldav/listStorageProvider.go b/pkg/routes/caldav/listStorageProvider.go
+index b3328eaaa..2a2ace18b 100644
+--- a/pkg/routes/caldav/listStorageProvider.go
++++ b/pkg/routes/caldav/listStorageProvider.go
+@@ -62,6 +62,22 @@ type VikunjaCaldavProjectStorage struct {
+ 	isEntry     bool // Entry level handling should only return a link to the principal url
+ }
+ 
++// userTimezone is the zone wall-clock dates (DUE/DTSTART/DTEND) are exported in.
++// Apple clients show anything without a resolvable TZID as GMT, so this is what
++// keeps reminders local. An unset or unparsable preference returns nil, which
++// keeps the historical UTC-only export.
++func (vcls *VikunjaCaldavProjectStorage) userTimezone() *time.Location {
++	if vcls.user == nil || vcls.user.Timezone == "" {
++		return nil
++	}
++	loc, err := time.LoadLocation(vcls.user.Timezone)
++	if err != nil {
++		log.Warningf("[CALDAV] Invalid timezone %q for user %d, exporting UTC: %v", vcls.user.Timezone, vcls.user.ID, err)
++		return nil
++	}
++	return loc
++}
++
+ // GetResources returns either all projects, links to the principal, or only one project, depending on the request
+ func (vcls *VikunjaCaldavProjectStorage) GetResources(rpath string, withChildren bool) ([]data.Resource, error) {
+ 
+@@ -79,6 +95,7 @@ func (vcls *VikunjaCaldavProjectStorage) GetResources(rpath string, withChildren
+ 
+ 	if vcls.isEntry {
+ 		r := data.NewResource(withTrailingSlash(rpath), &VikunjaProjectResourceAdapter{
++			timezone:     vcls.userTimezone(),
+ 			isPrincipal:  true,
+ 			isCollection: true,
+ 		})
+@@ -88,6 +105,7 @@ func (vcls *VikunjaCaldavProjectStorage) GetResources(rpath string, withChildren
+ 	// If the request wants the principal url, we'll return that and nothing else
+ 	if vcls.isPrincipal {
+ 		r := data.NewResource(ProjectHomeSetPath, &VikunjaProjectResourceAdapter{
++			timezone:     vcls.userTimezone(),
+ 			isPrincipal:  true,
+ 			isCollection: true,
+ 		})
+@@ -119,6 +137,7 @@ func (vcls *VikunjaCaldavProjectStorage) GetResources(rpath string, withChildren
+ 				emitted[href] = true
+ 
+ 				taskResource := VikunjaProjectResourceAdapter{
++					timezone:     vcls.userTimezone(),
+ 					project:      vcls.project,
+ 					task:         task,
+ 					isCollection: false,
+@@ -146,6 +165,7 @@ func (vcls *VikunjaCaldavProjectStorage) GetResources(rpath string, withChildren
+ 
+ 	if !withChildren {
+ 		r := data.NewResource(withTrailingSlash(rpath), &VikunjaProjectResourceAdapter{
++			timezone:     vcls.userTimezone(),
+ 			isPrincipal:  true,
+ 			isCollection: true,
+ 		})
+@@ -155,6 +175,7 @@ func (vcls *VikunjaCaldavProjectStorage) GetResources(rpath string, withChildren
+ 	var resources []data.Resource
+ 	for _, l := range projects {
+ 		rr := VikunjaProjectResourceAdapter{
++			timezone: vcls.userTimezone(),
+ 			project: &models.ProjectWithTasksAndBuckets{
+ 				Project: *l,
+ 			},
+@@ -271,7 +292,8 @@ func (vcls *VikunjaCaldavProjectStorage) GetResourcesByList(rpaths []string) (re
+ 		}
+ 		emitted[href] = true
+ 		rr := VikunjaProjectResourceAdapter{
+-			task: t,
++			timezone: vcls.userTimezone(),
++			task:     t,
+ 		}
+ 		addTaskResource(urlProjectID, t, &rr, &resources)
+ 	}
+@@ -294,6 +316,7 @@ func (vcls *VikunjaCaldavProjectStorage) GetResourcesByFilters(rpath string, _ *
+ 		var resources []data.Resource
+ 		for i := range vcls.project.Tasks {
+ 			rr := VikunjaProjectResourceAdapter{
++				timezone:     vcls.userTimezone(),
+ 				project:      vcls.project,
+ 				task:         &vcls.project.Tasks[i].Task,
+ 				isCollection: false,
+@@ -514,8 +537,9 @@ func (vcls *VikunjaCaldavProjectStorage) GetResource(rpath string) (*data.Resour
+ 		}
+ 
+ 		rr := VikunjaProjectResourceAdapter{
+-			project: vcls.project,
+-			task:    vcls.task,
++			timezone: vcls.userTimezone(),
++			project:  vcls.project,
++			task:     vcls.task,
+ 		}
+ 		r := data.NewResource(vcls.hrefFor(rpath), &rr)
+ 		return &r, true, nil
+@@ -645,8 +669,9 @@ func (vcls *VikunjaCaldavProjectStorage) CreateResource(rpath, content string) (
+ 
+ 	// Build up the proper response
+ 	rr := VikunjaProjectResourceAdapter{
+-		project: vcls.project,
+-		task:    vTask,
++		timezone: vcls.userTimezone(),
++		project:  vcls.project,
++		task:     vTask,
+ 	}
+ 	r := data.NewResource(rpath, &rr)
+ 	return &r, nil
+@@ -835,8 +860,9 @@ func (vcls *VikunjaCaldavProjectStorage) UpdateResource(rpath, content string) (
+ 
+ 	// base, not vTask: Update wrote back the Updated timestamp the etag is built from.
+ 	rr := VikunjaProjectResourceAdapter{
+-		project: vcls.project,
+-		task:    &base,
++		timezone: vcls.userTimezone(),
++		project:  vcls.project,
++		task:     &base,
+ 	}
+ 	r := data.NewResource(rpath, &rr)
+ 	return &r, nil
+@@ -1066,6 +1092,8 @@ type VikunjaProjectResourceAdapter struct {
+ 	project      *models.ProjectWithTasksAndBuckets
+ 	projectTasks []*models.TaskWithComments
+ 	task         *models.Task
++	// timezone is the CalDAV user's zone, used for the wall-clock date fields.
++	timezone *time.Location
+ 
+ 	isPrincipal  bool
+ 	isCollection bool
+@@ -1109,12 +1137,12 @@ func (vlra *VikunjaProjectResourceAdapter) CalculateEtag() string {
+ // GetContent returns the content string of a resource (a task in our case)
+ func (vlra *VikunjaProjectResourceAdapter) GetContent() string {
+ 	if vlra.project != nil && vlra.projectTasks != nil {
+-		return caldav.GetCaldavTodosForTasks(vlra.project, vlra.projectTasks)
++		return caldav.GetCaldavTodosForTasks(vlra.project, vlra.projectTasks, vlra.timezone)
+ 	}
+ 
+ 	if vlra.task != nil {
+ 		project := models.ProjectWithTasksAndBuckets{Tasks: []*models.TaskWithComments{{Task: *vlra.task}}}
+-		return caldav.GetCaldavTodosForTasks(&project, project.Tasks)
++		return caldav.GetCaldavTodosForTasks(&project, project.Tasks, vlra.timezone)
+ 	}
+ 
+ 	return ""
+@@ -1189,6 +1217,7 @@ func (vcls *VikunjaCaldavProjectStorage) getProjectRessource(isCollection bool)
+ 	}
+ 
+ 	rr = VikunjaProjectResourceAdapter{
++		timezone:     vcls.userTimezone(),
+ 		project:      vcls.project,
+ 		projectTasks: projectTasks,
+ 		isCollection: isCollection,
+diff --git a/pkg/routes/caldav/sync_collection.go b/pkg/routes/caldav/sync_collection.go
+index 97eb92113..14d907e71 100644
+--- a/pkg/routes/caldav/sync_collection.go
++++ b/pkg/routes/caldav/sync_collection.go
+@@ -235,7 +235,7 @@ func writeSyncResponse(
+ 		sb.WriteString("        <D:getetag>" + xmlEscape(etag) + "</D:getetag>\n")
+ 		if includeCalendarData {
+ 			project := rr.project
+-			calData := caldavpkg.GetCaldavTodosForTasks(project, []*models.TaskWithComments{t})
++			calData := caldavpkg.GetCaldavTodosForTasks(project, []*models.TaskWithComments{t}, rr.timezone)
+ 			sb.WriteString("        <C:calendar-data>" + xmlEscape(calData) + "</C:calendar-data>\n")
+ 		}
+ 		sb.WriteString("      </D:prop>\n")

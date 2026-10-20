@@ -1,0 +1,347 @@
+From d0b937a64a9576cb1eb14829419208f375ad0027 Mon Sep 17 00:00:00 2001
+From: bigoovip <86590318+bigoovip@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 15:23:19 +0800
+Subject: [PATCH 1/2] caldav: export DUE/DTSTART/DTEND with TZID + VTIMEZONE,
+ keep timestamps in UTC
+
+Downstream patch: iOS Reminders showed server-sent reminders as GMT because the
+CalDAV export wrote bare UTC with no TZID/VTIMEZONE. Wall-clock fields (DUE,
+DTSTART, DTEND, RRULE BYMONTHDAY) are now rendered in the CalDAV user's timezone
+with a TZID plus a matching VTIMEZONE block; DTSTAMP, CREATED, COMPLETED,
+LAST-MODIFIED and VALARM TRIGGER stay UTC per RFC 5545.
+GetCaldavTodosForTasks takes the timezone as a third argument.
+---
+ pkg/caldav/caldav.go        | 117 +++++++++++++++++++++++++++++++++---
+ pkg/caldav/parsing.go       |  11 +++-
+ pkg/caldav/parsing_test.go  |   2 +-
+ pkg/caldav/timezone_test.go | 102 +++++++++++++++++++++++++++++++
+ 4 files changed, 221 insertions(+), 11 deletions(-)
+ create mode 100644 pkg/caldav/timezone_test.go
+
+diff --git a/pkg/caldav/caldav.go b/pkg/caldav/caldav.go
+index 497b7249b..31001d010 100644
+--- a/pkg/caldav/caldav.go
++++ b/pkg/caldav/caldav.go
+@@ -17,6 +17,8 @@
+ package caldav
+ 
+ import (
++	"fmt"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+@@ -87,9 +89,10 @@ type Relation struct {
+ 
+ // Config is the caldav calendar config
+ type Config struct {
+-	Name   string
+-	ProdID string
+-	Color  string
++	Name     string
++	ProdID   string
++	Color    string
++	Timezone *time.Location // wall-clock zone for DUE/DTSTART/DTEND; nil keeps UTC (trailing Z)
+ }
+ 
+ // getCaldavColor sanitizes color at the output boundary (non-hex chars
+@@ -160,6 +163,15 @@ X-PUBLISHED-TTL:PT4H
+ X-WR-CALNAME:` + escapeICalText(config.Name) + `
+ PRODID:-//` + config.ProdID + `//EN` + getCaldavColor(config.Color)
+ 
++	// Apple clients label every VTODO without a resolvable TZID as GMT, so emit
++	// the user's zone explicitly: a TZID on the wall-clock fields plus the
++	// VTIMEZONE component that makes that TZID resolvable.
++	loc := config.Timezone
++	if isIanaTimezone(loc) {
++		caldavtodos += `
++X-WR-TIMEZONE:` + loc.String() + vtimezoneBlock(loc)
++	}
++
+ 	for _, t := range todos {
+ 		if t.UID == "" {
+ 			t.UID = makeCalDavTimeFromTimeStamp(t.Timestamp) + utils.Sha256(t.Summary)
+@@ -173,7 +185,7 @@ SUMMARY:` + escapeICalText(t.Summary) + getCaldavColor(t.Color)
+ 
+ 		if t.Start.Unix() > 0 {
+ 			caldavtodos += `
+-DTSTART:` + makeCalDavTimeFromTimeStamp(t.Start)
++DTSTART` + makeCalDavWallTime(t.Start, loc)
+ 			if t.Duration != 0 && t.DueDate.Unix() == 0 {
+ 				caldavtodos += `
+ DURATION:PT` + formatDuration(t.Duration)
+@@ -181,7 +193,7 @@ DURATION:PT` + formatDuration(t.Duration)
+ 		}
+ 		if t.End.Unix() > 0 {
+ 			caldavtodos += `
+-DTEND:` + makeCalDavTimeFromTimeStamp(t.End)
++DTEND` + makeCalDavWallTime(t.End, loc)
+ 		}
+ 		if t.Description != "" {
+ 			// CalDAV clients show plain text, so emit markdown. On the near-impossible
+@@ -217,7 +229,7 @@ ORGANIZER;CN=:` + escapeICalText(t.Organizer.Username)
+ 
+ 		if t.DueDate.Unix() > 0 {
+ 			caldavtodos += `
+-DUE:` + makeCalDavTimeFromTimeStamp(t.DueDate)
++DUE` + makeCalDavWallTime(t.DueDate, loc)
+ 		}
+ 
+ 		if t.Created.Unix() > 0 {
+@@ -233,7 +245,7 @@ PRIORITY:` + strconv.Itoa(mapPriorityToCaldav(t.Priority))
+ 		if t.RepeatAfter > 0 || t.RepeatMode == models.TaskRepeatModeMonth {
+ 			if t.RepeatMode == models.TaskRepeatModeMonth {
+ 				caldavtodos += `
+-RRULE:FREQ=MONTHLY;BYMONTHDAY=` + t.DueDate.Format("02") // Day of the month
++RRULE:FREQ=MONTHLY;BYMONTHDAY=` + t.DueDate.In(wallClockZone(loc)).Format("02") // Day of the month, in the zone DUE was written in
+ 			} else {
+ 				freq, interval := getRruleFromInterval(t.RepeatAfter)
+ 				caldavtodos += `
+@@ -336,6 +348,97 @@ func makeCalDavTimeFromTimeStamp(ts time.Time) (caldavtime string) {
+ 	return ts.In(time.UTC).Format(DateFormat) + "Z"
+ }
+ 
++// wallClockZone is the zone wall clocks are rendered in: the CalDAV user's zone
++// when it is a real IANA zone, UTC otherwise.
++func wallClockZone(loc *time.Location) *time.Location {
++	if isIanaTimezone(loc) {
++		return loc
++	}
++	return time.UTC
++}
++
++// isIanaTimezone reports whether loc names a real IANA zone. Go's UTC, Local and
++// fixed-offset zones carry no "/" in their name and must keep the trailing-Z form.
++func isIanaTimezone(loc *time.Location) bool {
++	return loc != nil && strings.Contains(loc.String(), "/")
++}
++
++// makeCalDavWallTime renders ts as a wall clock in the user's zone, tagged with a
++// TZID parameter (";TZID=Asia/Shanghai:20261020T195900"). Clients that store what
++// the server sends then keep the intended wall clock instead of converting from
++// UTC. Without a usable zone the portable UTC form (":20261020T115900Z") is used.
++func makeCalDavWallTime(ts time.Time, loc *time.Location) string {
++	if !isIanaTimezone(loc) {
++		return ":" + makeCalDavTimeFromTimeStamp(ts)
++	}
++	return ";TZID=" + loc.String() + ":" + ts.In(loc).Format(DateFormat)
++}
++
++// formatUtcOffset renders seconds east of UTC as an RFC 5545 UTC offset (+0800).
++func formatUtcOffset(seconds int) string {
++	sign := "+"
++	if seconds < 0 {
++		sign = "-"
++		seconds = -seconds
++	}
++	return fmt.Sprintf("%s%02d%02d", sign, seconds/3600, (seconds%3600)/60)
++}
++
++// vtimezoneBlock renders a VTIMEZONE component for loc. Apple clients cannot
++// resolve a TZID without one and silently fall back to GMT. Observances are
++// derived from the zone itself (offset scan + first onset this year), so no tz
++// database has to ship and DST zones stay correct. Asia/Shanghai, which has no
++// DST, yields a single STANDARD observance.
++func vtimezoneBlock(loc *time.Location) (block string) {
++	year := time.Now().In(loc).Year()
++	start := time.Date(year, time.January, 1, 0, 0, 0, 0, loc)
++	end := start.AddDate(1, 0, 0)
++
++	type observance struct {
++		name   string
++		offset int
++		onset  time.Time
++	}
++	byOffset := map[int]*observance{}
++	for probe := start; probe.Before(end); probe = probe.Add(time.Hour) {
++		name, offset := probe.Zone()
++		if _, ok := byOffset[offset]; !ok {
++			byOffset[offset] = &observance{name: name, offset: offset, onset: probe}
++		}
++	}
++
++	offsets := make([]int, 0, len(byOffset))
++	for offset := range byOffset {
++		offsets = append(offsets, offset)
++	}
++	sort.Ints(offsets)
++	if len(offsets) > 2 {
++		// Historical oddities: keep the two the zone actually uses most recently.
++		offsets = offsets[len(offsets)-2:]
++	}
++
++	var b strings.Builder
++	b.WriteString("\nBEGIN:VTIMEZONE\nTZID:" + loc.String() + "\n")
++	for i, offset := range offsets {
++		kind := "STANDARD"
++		if len(offsets) == 2 && i == len(offsets)-1 {
++			// Daylight saving always adds time, so the larger offset is DAYLIGHT.
++			kind = "DAYLIGHT"
++		}
++		o := byOffset[offset]
++		b.WriteString("BEGIN:" + kind + "\n")
++		b.WriteString("DTSTART:" + o.onset.UTC().Format(DateFormat) + "Z\n")
++		b.WriteString("TZOFFSETFROM:" + formatUtcOffset(offset) + "\n")
++		b.WriteString("TZOFFSETTO:" + formatUtcOffset(offset) + "\n")
++		if o.name != "" {
++			b.WriteString("TZNAME:" + escapeICalText(o.name) + "\n")
++		}
++		b.WriteString("END:" + kind + "\n")
++	}
++	b.WriteString("END:VTIMEZONE")
++	return b.String()
++}
++
+ func makeCalDavDuration(duration time.Duration) (caldavtime string) {
+ 	if duration < 0 {
+ 		duration = duration.Abs()
+diff --git a/pkg/caldav/parsing.go b/pkg/caldav/parsing.go
+index 855b429a4..2c37d14c9 100644
+--- a/pkg/caldav/parsing.go
++++ b/pkg/caldav/parsing.go
+@@ -184,7 +184,11 @@ func init() {
+ 	}
+ }
+ 
+-func GetCaldavTodosForTasks(project *models.ProjectWithTasksAndBuckets, projectTasks []*models.TaskWithComments) string {
++// GetCaldavTodosForTasks renders a project's tasks as an iCalendar feed. timezone
++// is the CalDAV user's zone: wall-clock fields are exported in it (with a TZID and
++// a VTIMEZONE) so Apple clients show local time instead of GMT. Pass nil to keep
++// the historical UTC-only export.
++func GetCaldavTodosForTasks(project *models.ProjectWithTasksAndBuckets, projectTasks []*models.TaskWithComments, timezone *time.Location) string {
+ 
+ 	// Make caldav todos from Vikunja todos
+ 	var caldavtodos []*Todo
+@@ -238,8 +242,9 @@ func GetCaldavTodosForTasks(project *models.ProjectWithTasksAndBuckets, projectT
+ 	}
+ 
+ 	caldavConfig := &Config{
+-		Name:   project.Title,
+-		ProdID: "Vikunja Todo App",
++		Name:     project.Title,
++		ProdID:   "Vikunja Todo App",
++		Timezone: timezone,
+ 	}
+ 
+ 	return ParseTodos(caldavConfig, caldavtodos)
+diff --git a/pkg/caldav/parsing_test.go b/pkg/caldav/parsing_test.go
+index a3c0fbb0b..231ff29c2 100644
+--- a/pkg/caldav/parsing_test.go
++++ b/pkg/caldav/parsing_test.go
+@@ -1073,7 +1073,7 @@ END:VCALENDAR`,
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			got := GetCaldavTodosForTasks(tt.args.list, tt.args.tasks)
++			got := GetCaldavTodosForTasks(tt.args.list, tt.args.tasks, nil)
+ 			if diff, equal := messagediff.PrettyDiff(got, tt.wantCaldav); !equal {
+ 				t.Errorf("GetCaldavTodosForTasks() gotVTask = %v, want %v, diff = %s", got, tt.wantCaldav, diff)
+ 			}
+diff --git a/pkg/caldav/timezone_test.go b/pkg/caldav/timezone_test.go
+new file mode 100644
+index 000000000..455fd3cf5
+--- /dev/null
++++ b/pkg/caldav/timezone_test.go
+@@ -0,0 +1,102 @@
++package caldav
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// Apple clients label every VTODO whose dates lack a resolvable TZID as GMT.
++// These assertions pin the export contract: wall-clock fields carry a TZID plus
++// the matching VTIMEZONE, absolute-time fields stay UTC, and a nil/UTC zone keeps
++// the historical trailing-Z form.
++func TestParseTodosTimezone(t *testing.T) {
++	shanghai, err := time.LoadLocation("Asia/Shanghai")
++	require.NoError(t, err)
++	newYork, err := time.LoadLocation("America/New_York")
++	require.NoError(t, err)
++
++	// 19:59 on 2026-10-20 in Shanghai is 11:59 UTC.
++	shanghaiDue := time.Date(2026, 10, 20, 19, 59, 0, 0, shanghai)
++
++	t.Run("wall clock fields carry TZID and a VTIMEZONE", func(t *testing.T) {
++		out := ParseTodos(&Config{Name: "Inbox", ProdID: "Vikunja", Timezone: shanghai}, []*Todo{{
++			Summary:   "抢京东 PLUS 超级补贴",
++			UID:       "uid-133",
++			Timestamp: shanghaiDue,
++			Start:     shanghaiDue,
++			End:       shanghaiDue.Add(time.Hour),
++			DueDate:   shanghaiDue,
++		}})
++
++		assert.Contains(t, out, "\nDUE;TZID=Asia/Shanghai:20261020T195900")
++		assert.Contains(t, out, "\nDTSTART;TZID=Asia/Shanghai:20261020T195900")
++		assert.Contains(t, out, "\nDTEND;TZID=Asia/Shanghai:20261020T205900")
++
++		// The TZID has to be resolvable, or clients fall back to GMT again.
++		assert.Contains(t, out, "BEGIN:VTIMEZONE\nTZID:Asia/Shanghai\n")
++		assert.Contains(t, out, "TZOFFSETTO:+0800")
++		assert.Contains(t, out, "X-WR-TIMEZONE:Asia/Shanghai")
++
++		// RFC 5545: a TZID value is a local time and never carries a trailing Z.
++		assert.NotContains(t, out, "TZID=Asia/Shanghai:20261020T115900")
++		assert.NotContains(t, out, "\nDUE:20261020T115900Z")
++
++		// Absolute-time properties must stay UTC.
++		assert.Contains(t, out, "DTSTAMP:20261020T115900Z")
++	})
++
++	t.Run("nil timezone keeps the portable UTC form", func(t *testing.T) {
++		out := ParseTodos(&Config{Name: "Inbox", ProdID: "Vikunja"}, []*Todo{{
++			Summary:   "抢京东 PLUS 超级补贴",
++			UID:       "uid-133",
++			Timestamp: shanghaiDue,
++			DueDate:   shanghaiDue,
++		}})
++
++		assert.Contains(t, out, "\nDUE:20261020T115900Z")
++		assert.NotContains(t, out, "VTIMEZONE")
++		assert.NotContains(t, out, "TZID")
++	})
++
++	t.Run("utc is not given a TZID", func(t *testing.T) {
++		out := ParseTodos(&Config{Name: "Inbox", ProdID: "Vikunja", Timezone: time.UTC}, []*Todo{{
++			Summary:   "Todo",
++			UID:       "uid",
++			Timestamp: shanghaiDue,
++			DueDate:   shanghaiDue,
++		}})
++
++		assert.Contains(t, out, "\nDUE:20261020T115900Z")
++		assert.NotContains(t, out, "TZID")
++	})
++
++	t.Run("dst zones get both observances", func(t *testing.T) {
++		summer := time.Date(2026, 7, 15, 9, 30, 0, 0, newYork)
++		out := ParseTodos(&Config{Name: "Inbox", ProdID: "Vikunja", Timezone: newYork}, []*Todo{{
++			Summary:   "Todo",
++			UID:       "uid",
++			Timestamp: summer,
++			DueDate:   summer,
++		}})
++
++		assert.Contains(t, out, "\nDUE;TZID=America/New_York:20260715T093000")
++		assert.Contains(t, out, "TZID:America/New_York")
++		assert.Contains(t, out, "TZOFFSETTO:-0500")
++		assert.Contains(t, out, "TZOFFSETTO:-0400")
++		assert.Contains(t, out, "BEGIN:DAYLIGHT")
++		assert.Contains(t, out, "BEGIN:STANDARD")
++	})
++}
++
++func TestMakeCalDavWallTime(t *testing.T) {
++	shanghai, err := time.LoadLocation("Asia/Shanghai")
++	require.NoError(t, err)
++	ts := time.Date(2026, 10, 20, 11, 59, 0, 0, time.UTC)
++
++	assert.Equal(t, ";TZID=Asia/Shanghai:20261020T195900", makeCalDavWallTime(ts, shanghai))
++	assert.Equal(t, ":20261020T115900Z", makeCalDavWallTime(ts, nil))
++	assert.Equal(t, ":20261020T115900Z", makeCalDavWallTime(ts, time.UTC))
++}

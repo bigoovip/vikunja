@@ -1,0 +1,67 @@
+name: Promote release (the deploy gate)
+
+# 上线闸：推一个 v* tag（或在 Actions 里手动 dispatch 指定产物 tag），就把那个**已构建好**的镜像
+# 挪到浮动别名 tz（Komodo 盯这个别名）。不重新构建，只做 registry 侧 retag，几秒完成。
+#
+# 所以：upstream-watch 出候选镜像 → 这里的 tag 动作 = 上生产。
+# 镜像不存在就直接失败（防止手滑把不存在的版本推上线）。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '要上线的产物 tag（如 v2.7.0-tz.2）'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Retag to tz
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REL: ${{ inputs.release || github.ref_name }}
+      IMG: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the candidate image exists
+        run: |
+          set -euo pipefail
+          echo "candidate: ${IMG}:${REL}"
+          docker buildx imagetools inspect "${IMG}:${REL}" | sed -n '1,6p'
+
+      - name: Move the aliases
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMG}:tz" \
+            -t "${IMG}:latest" \
+            "${IMG}:${REL}"
+          echo "--- tz now points at ---"
+          docker buildx imagetools inspect "${IMG}:tz" | sed -n '1,6p'
+
+      - run: |
+          {
+            echo "### 上线：\`${REL}\` → \`tz\`"
+            echo ""
+            echo '```'
+            echo "Komodo 栈 vikunja 盯 ghcr.io/bigoovip/vikunja:tz，digest 变化后自动 pull+重建。"
+            echo "回滚：promote 上一次的产物 tag，或把 compose 的 image 钉回 mirror.gcr.io/vikunja/vikunja:2.7.0。"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

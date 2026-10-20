@@ -1,0 +1,161 @@
+name: Upstream watch (build patched image)
+
+# 自动跟上游：每天检查 go-vikunja/vikunja 的最新 release，把 patches/series 套到它的源码上，
+# 跑测试，通过就构建出**候选镜像** <上游tag>-tz.<n>（不可变 tag）。
+#
+# 它**不碰生产**：浮动别名 tz 只由 promote.yml（推 v* tag）移动。
+# 无新版本时静默退出，不发通知。
+
+on:
+  schedule:
+    - cron: '15 0 * * *'          # 08:15 CST，每天一次
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: '上游 tag（留空 = GitHub 最新 release）'
+        required: false
+        default: ''
+      release:
+        description: '本次产物 tag（留空 = <上游tag>-tz.1）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      upstream: ${{ steps.r.outputs.upstream }}
+      release: ${{ steps.r.outputs.release }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: r
+        env:
+          IN_TAG: ${{ inputs.upstream_tag }}
+          IN_REL: ${{ inputs.release }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          up="${IN_TAG}"
+          if [ -z "$up" ]; then
+            up=$(curl -fsS https://api.github.com/repos/go-vikunja/vikunja/releases/latest | jq -r .tag_name)
+          fi
+          rel="${IN_REL:-${up}-tz.1}"
+          echo "upstream=$up  release=$rel"
+          # 无状态判断：同名镜像已存在就什么都不做（包是公开的，匿名可查）
+          if docker manifest inspect "ghcr.io/${REPO}:${rel}" >/dev/null 2>&1; then
+            echo "image ghcr.io/${REPO}:${rel} already exists — nothing to build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "upstream=$up" >> "$GITHUB_OUTPUT"
+          echo "release=$rel" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Patch + test + build ${{ needs.resolve.outputs.release }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      UPSTREAM: ${{ needs.resolve.outputs.upstream }}
+      RELEASE: ${{ needs.resolve.outputs.release }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5          # 本仓库 main：patches/ + 这个 workflow
+        with:
+          fetch-depth: 1
+
+      - name: Stage the patch series
+        run: cp -r patches/series /tmp/patches
+
+      - name: Rebase the patches onto the upstream release
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/go-vikunja/vikunja.git
+          git fetch --depth=1 upstream "refs/tags/${UPSTREAM}:refs/tags/${UPSTREAM}"
+          git checkout -B "build/${RELEASE}" "${UPSTREAM}"
+          git -c user.name=ci -c user.email=ci@localhost am -3 /tmp/patches/*.patch
+
+      - name: Guard — the patch series and main must agree
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin main
+          if ! git diff --quiet FETCH_HEAD -- pkg/; then
+            echo "::error::patches/series 与 main 的 pkg/ 不一致：改了源码就要重新生成补丁序列"
+            git diff --stat FETCH_HEAD -- pkg/
+            exit 1
+          fi
+          echo "patched tree == main (pkg/)"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - name: go vet + test the patched packages
+        run: |
+          go vet ./pkg/caldav/ ./pkg/routes/caldav/
+          go test ./pkg/caldav/ ./pkg/routes/caldav/
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the candidate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            RELEASE_VERSION=${{ needs.resolve.outputs.release }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ needs.resolve.outputs.release }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report digest
+        run: |
+          docker buildx imagetools inspect "ghcr.io/${REPO}:${RELEASE}" | sed -n '1,8p'
+
+      # 包默认私有 Komodo 就拉不到；新版本沿用包级设置，这里再兜一次（幂等）。
+      - name: Make the package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PKG: ${{ github.event.repository.name }}
+        run: |
+          set -uo pipefail
+          PKG="${PKG:-vikunja}"
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /tmp/pkg.json -w '%{http_code}' -X PATCH \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/packages/container/${PKG}" \
+              -d '{"visibility":"public"}')
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "204" ] || [ "$code" = "200" ]; then exit 0; fi
+            cat /tmp/pkg.json || true
+            sleep 15
+          done
+          echo "::warning::could not set package visibility; set it by hand in Packages → ${PKG} → settings"
