@@ -59,8 +59,15 @@ jobs:
           if [ -z "$up" ] || [ "$up" = "null" ]; then echo "::error::cannot resolve upstream release"; exit 1; fi
           rel="${IN_REL:-${up}-tz.1}"
           echo "upstream=$up  release=$rel"
-          # 无状态判断：同名镜像已存在就什么都不做（包是公开的，匿名可查）
-          if docker manifest inspect "ghcr.io/${REPO}:${rel}" >/dev/null 2>&1; then
+          # 无状态判断：这个上游版本已经出过任何 <上游tag>-tz.* 镜像就跳过。
+          # （不能只查 <up>-tz.1：人工 dispatch 出过 -tz.2 之后，日常巡检不该再补一个 -tz.1）
+          tok=$(curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" | jq -r .token)
+          have=$(curl -fsS -H "Authorization: Bearer ${tok}" \
+                 "https://ghcr.io/v2/${REPO}/tags/list?n=1000" | jq -r '.tags[]?' | grep -c "^${up}-tz\." || true)
+          if [ "${have:-0}" -gt 0 ] && [ -z "${IN_REL}" ]; then
+            echo "ghcr.io/${REPO} already has ${have} image(s) for upstream ${up} — nothing to build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif docker manifest inspect "ghcr.io/${REPO}:${rel}" >/dev/null 2>&1; then
             echo "image ghcr.io/${REPO}:${rel} already exists — nothing to build"
             echo "build=false" >> "$GITHUB_OUTPUT"
           else
