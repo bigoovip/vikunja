@@ -33,4 +33,3 @@ jobs:
         run: |
           go vet ./pkg/caldav/ ./pkg/routes/caldav/
           go test ./pkg/caldav/ ./pkg/routes/caldav/
-# perm probe (temporary)
