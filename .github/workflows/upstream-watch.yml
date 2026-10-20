@@ -47,12 +47,16 @@ jobs:
           IN_TAG: ${{ inputs.upstream_tag }}
           IN_REL: ${{ inputs.release }}
           REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           up="${IN_TAG}"
           if [ -z "$up" ]; then
-            up=$(curl -fsS https://api.github.com/repos/go-vikunja/vikunja/releases/latest | jq -r .tag_name)
+            # 匿名调用在 Actions 共享 IP 上会被 403 限流，必须带 token
+            up=$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+                 https://api.github.com/repos/go-vikunja/vikunja/releases/latest | jq -r .tag_name)
           fi
+          if [ -z "$up" ] || [ "$up" = "null" ]; then echo "::error::cannot resolve upstream release"; exit 1; fi
           rel="${IN_REL:-${up}-tz.1}"
           echo "upstream=$up  release=$rel"
           # 无状态判断：同名镜像已存在就什么都不做（包是公开的，匿名可查）
