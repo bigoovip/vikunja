@@ -1,0 +1,85 @@
+name: Build image
+
+# 自编译 Vikunja（2.7.0 + CalDAV TZID 补丁）→ ghcr.io/bigoovip/vikunja
+# 包里只改了后端导出层；前端、库结构、迁移都没有动。
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go tests (caldav)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: go vet + test the patched packages
+        run: |
+          go vet ./pkg/caldav/ ./pkg/routes/caldav/
+          go test ./pkg/caldav/ ./pkg/routes/caldav/
+
+  build:
+    name: Build and push
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            RELEASE_VERSION=2.7.0-tz
+          tags: |
+            ghcr.io/${{ github.repository }}:2.7.0-tz
+            ghcr.io/${{ github.repository }}:2.7.0
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 包默认私有，Komodo 就拉不到；这里顺手改成公开（匿名拉取）。
+      - name: Make the package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PKG: ${{ github.event.repository.name }}
+        run: |
+          set -uo pipefail
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /tmp/pkg.json -w '%{http_code}' -X PATCH \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/packages/container/$PKG" \
+              -d '{"visibility":"public"}')
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "204" ] || [ "$code" = "200" ]; then exit 0; fi
+            cat /tmp/pkg.json || true
+            sleep 15
+          done
+          echo "::warning::could not set package visibility; set it by hand in Packages → $PKG → settings"
