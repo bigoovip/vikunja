@@ -102,16 +102,35 @@ jobs:
           git checkout -B "build/${RELEASE}" "${UPSTREAM}"
           git -c user.name=ci -c user.email=ci@localhost am -3 /tmp/patches/*.patch
 
-      - name: Guard — the patch series and main must agree
+      # 守卫目的是防「main 上直接改了源码却没重新生成 patches/series」。
+      # 判据：main 的 pkg/ 必须等于「补丁基线 tag + 补丁序列」。
+      # 基线写在 patches/base（单行上游 tag），而不是拿当前 UPSTREAM 比 ——
+      # 上游一发新版，main 的 pkg/（旧基线）必然与新 UPSTREAM 不同，
+      # 拿 UPSTREAM 比会把「上游升版」误判成「补丁漂移」（2026-10-21 v2.7.1 踩过）。
+      - name: Guard — main must equal patches/base + the patch series
         run: |
           set -euo pipefail
+          base=$(tr -d '[:space:]' < patches/base)
+          if [ -z "$base" ]; then
+            echo "::error::patches/base 为空，必须写一行补丁基线上游 tag（如 v2.7.0）"
+            exit 1
+          fi
+          echo "patch baseline: ${base}"
+          git remote get-url upstream >/dev/null 2>&1 || \
+            git remote add upstream https://github.com/go-vikunja/vikunja.git
+          git fetch --depth=1 upstream "refs/tags/${base}:refs/tags/${base}"
+          cp -r patches/series /tmp/patches-base
+          git checkout -B "guard/${base}" "${base}"
+          git -c user.name=ci -c user.email=ci@localhost am -3 /tmp/patches-base/*.patch
           git fetch --depth=1 origin main
           if ! git diff --quiet FETCH_HEAD -- pkg/; then
-            echo "::error::patches/series 与 main 的 pkg/ 不一致：改了源码就要重新生成补丁序列"
+            echo "::error::main 的 pkg/ 与 patches/base(${base}) + patches/series 不一致：改了源码就要重新生成补丁序列（并同步 patches/base）"
             git diff --stat FETCH_HEAD -- pkg/
             exit 1
           fi
-          echo "patched tree == main (pkg/)"
+          echo "main == ${base} + patches/series (pkg/)"
+          # 守卫换了分支，切回已打好补丁的构建分支（不要重建！否则工作区是未打补丁的上游源码）
+          git checkout "build/${RELEASE}"
 
       - uses: actions/setup-go@v6
         with:
