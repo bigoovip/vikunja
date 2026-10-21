@@ -110,6 +110,8 @@ jobs:
       - name: Guard — main must equal patches/base + the patch series
         run: |
           set -euo pipefail
+          # 此刻工作区在 build/ 分支（上游源码，没有 patches/）——守卫要用 main 里的补丁序列
+          git checkout main
           base=$(tr -d '[:space:]' < patches/base)
           if [ -z "$base" ]; then
             echo "::error::patches/base 为空，必须写一行补丁基线上游 tag（如 v2.7.0）"
