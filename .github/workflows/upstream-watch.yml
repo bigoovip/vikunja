@@ -132,9 +132,9 @@ jobs:
           git checkout -B "guard/${base}" "${base}"
           git -c user.name=ci -c user.email=ci@localhost am -3 /tmp/patches-base/*.patch
           git fetch --depth=1 origin main
-          if ! git diff --quiet FETCH_HEAD -- pkg/; then
-            echo "::error::main 的 pkg/ 与 patches/base(${base}) + patches/series 不一致：改了源码就要重新生成补丁序列（并同步 patches/base）"
-            git diff --stat FETCH_HEAD -- pkg/
+          if ! git diff --quiet FETCH_HEAD -- pkg/ go.mod go.sum; then
+            echo "::error::main 的 pkg/（及 go.mod/go.sum）与 patches/base(${base}) + patches/series 不一致：改了源码就要重新生成补丁序列（并同步 patches/base / go.mod / go.sum）"
+            git diff --stat FETCH_HEAD -- pkg/ go.mod go.sum
             exit 1
           fi
           echo "main == ${base} + patches/series (pkg/)"
