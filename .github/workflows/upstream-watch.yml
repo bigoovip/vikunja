@@ -98,7 +98,14 @@ jobs:
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/go-vikunja/vikunja.git
+          # 补丁基线 tag 也要取：git am -3 的三方合并要靠基线里那份文件的 blob 重建「假祖先」。
+          # 只取当天上游 tag（depth=1）时，一遇冲突就报 "could not build fake ancestor"，
+          # 看起来像补丁坏了，其实只是对象库里没有基线 blob（2026-11-06 v2.8.0 踩过）。
+          base=$(tr -d '[:space:]' < patches/base)
           git fetch --depth=1 upstream "refs/tags/${UPSTREAM}:refs/tags/${UPSTREAM}"
+          if [ -n "${base}" ] && [ "${base}" != "${UPSTREAM}" ]; then
+            git fetch --depth=1 upstream "refs/tags/${base}:refs/tags/${base}"
+          fi
           git checkout -B "build/${RELEASE}" "${UPSTREAM}"
           git -c user.name=ci -c user.email=ci@localhost am -3 /tmp/patches/*.patch
 
